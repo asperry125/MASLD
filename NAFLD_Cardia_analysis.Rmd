@@ -1,0 +1,1046 @@
+---
+title: "NAFLD"
+author: "Andrew Perry"
+date: '`r Sys.Date()`'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Import data
+
+```{r}
+library(tidyverse)
+library(gtsummary)
+library(caret)
+library(doParallel)
+library(foreach)
+library(nricens)
+library(pROC)
+
+somaDataFile <- "/Users/perry/Library/CloudStorage/OneDrive-VUMC/Research/CARDIA/Proteomics QC Files/CARDIA_Y25_Final_Proteomics.Rdata"
+somaDictionaryFile <- "/Users/perry/Library/CloudStorage/OneDrive-VUMC/Research/CARDIA/Proteomics QC Files/CARDIA_Y25_Proteomics_DictionaryQC.csv"
+CARDIAFile <- "/Users/perry/Library/CloudStorage/OneDrive-VUMC/Research/CARDIA/Data from Laura/CARDexpoV5.csv"
+ukbbOverlapDictionary <- "/Users/perry/Library/CloudStorage/OneDrive-VUMC/Research/CARDIA/Exercise proteomics/Coding Files/CARDIA_UKBB_overlapDictionary.csv"
+
+load(somaDataFile)
+protein.dictionary <- readr::read_csv(somaDictionaryFile)
+cardia.data <- readr::read_csv(CARDIAFile)
+ukbb.overlaps <- readr::read_csv(ukbbOverlapDictionary)
+
+filesToMd5 <- c(somaDataFile,
+                somaDictionaryFile,
+                CARDIAFile)
+
+dataFileInfo=data.frame(
+  File=basename(filesToMd5),
+  md5=tools::md5sum(filesToMd5)
+)
+
+knitr::kable(dataFileInfo)
+outputFilesToMd5 <- NULL
+```
+
+# Add missing EntrezGeneSymbols to the protein dictionary
+
+I manually looked these up at https://www.genenames.org
+
+```{r}
+protein.dictionary$EntrezGeneSymbol <- case_when(protein.dictionary$EntrezGeneID=="645142" ~ "PPIAL4D",
+                                                 protein.dictionary$EntrezGeneID=="101180976" ~ "IFNL4",
+                                                 protein.dictionary$EntrezGeneID=="100128071" ~ "FAM229A",
+                                                 protein.dictionary$EntrezGeneID=="401285" ~ "TCP10L2",
+                                                 protein.dictionary$EntrezGeneID=="100131244" ~ "ANKRD63",
+                                                 protein.dictionary$EntrezGeneID=="147646" ~ "C19orf84",
+                                                 protein.dictionary$EntrezGeneID=="648791" ~ "PPP1R3G",
+                                                 protein.dictionary$EntrezGeneID=="83715" ~ "ESPN",
+                                                 protein.dictionary$EntrezGeneID=="8209" ~ NA,
+                                                 protein.dictionary$EntrezGeneID=="100134938" ~"UPK3BL1" ,
+                                                 protein.dictionary$EntrezGeneID=="2651" ~ NA,
+                                                 protein.dictionary$EntrezGeneID=="402117" ~ "VWC2L",
+                                                 protein.dictionary$EntrezGeneID=="140862" ~ "ISM1",
+                                                 protein.dictionary$EntrezGeneID=="143678" ~ "FREY1",
+                                                 protein.dictionary$EntrezGeneID=="647087" ~ "STMP1",
+                                                 .default = protein.dictionary$EntrezGeneSymbol)
+```
+
+
+# Remove non-Human, non-proteins, high CV, the random CARDIA participant
+```{r}
+cv.cutoff=20
+
+# I was advised to remove this participant from all studies
+cardia.data <- cardia.data %>% filter(ID!=203323105195)
+
+# find the non-human, non-protein stuff
+table(protein.dictionary$Type)
+nonProteins <- protein.dictionary %>% 
+               filter(Type!="Protein") %>% 
+               pull(AptName)
+
+proteinsRemovedCV <- protein.dictionary %>% 
+                     filter(interplate.cv > cv.cutoff | median.intraplate.cv > cv.cutoff) %>% 
+                     pull(AptName)
+
+dim(CARDIA_Y25_Final_Proteomics)
+CARDIA_Y25_Final_Proteomics <- CARDIA_Y25_Final_Proteomics %>%
+                               select(!any_of(c(nonProteins, proteinsRemovedCV)))
+dim(CARDIA_Y25_Final_Proteomics)
+```
+
+I removed `r length(nonProteins)` non-human or non-proteins.
+
+I removed `r length(proteinsRemovedCV)` proteins for CV > `r cv.cutoff`%.
+
+log and scale proteins
+```{r}
+proteins.to.use <- colnames(CARDIA_Y25_Final_Proteomics %>% select(starts_with("seq")))
+CARDIA_Y25_Final_Proteomics[,proteins.to.use] <- scale(log(CARDIA_Y25_Final_Proteomics[,proteins.to.use]))
+```
+
+
+# Exclude participants with other liver disease
+
+**From Laua Colangelo (NW)**
+
+  Attached is the dataset CARDexpoV4. This is CARDexpoV3 with the new variables added.
+   
+  Below are a few definitions and notes:
+   
+  drink_wk = sum(h07wine,h07beer,h07liqr);
+  if h07drink=1 then drink_wk=0;
+   
+  if sex=1 then heavy_drink=( drink_wk > 21);
+  if sex=2 then heavy_drink=( drink_wk > 14);
+   
+  ex_med25=(amiodarone25=1 or valproic25=1 or
+            methotrex25=1 or tamox25=1 or diltia25=1);
+   
+  anyHEPabc = (h08hep=2 or h08hepa=2 or h08hepb=2 or h08hepc=2);
+  onlyHEPc =(h08hepc=2);
+   
+  EXCLUDE1 =(ex_med25=1 or  heavy_drink=1 or anyHEPabc=1 or h08liver=2 or h08cir=2 or h08hiv=2);
+  EXCLUDE2 =(ex_med25=1 or  heavy_drink=1 or onlyHEPc=1 or h08cir=2 or h08hiv=2);
+   
+   
+  I worked on a van Wagner paper that is earlier than the one you linked to.
+  In it, we excluded for hepatitis C.  James Terry seems to be suggesting excluding all of hepatitis A, B, and C.
+  So I created the two exclusion variables EXCLUDE1 and EXCLUDE2.
+  
+**Andrew's plan**
+
+I will use the convention used in this paper: https://www.ahajournals.org/doi/full/10.1161/JAHA.119.014279
+
+This corresponds to EXCLUDE2 variable
+
+```{r}
+# change ID formatting on proteomics dataset
+CARDIA_Y25_Final_Proteomics <- CARDIA_Y25_Final_Proteomics %>% 
+                               mutate(short_id = gsub("-", "", SubjectID)) %>%
+                               relocate(short_id, .before = everything())
+CARDIA_Y25_Final_Proteomics$short_id <- gsub("Y25","", CARDIA_Y25_Final_Proteomics$short_id)
+
+cardia.data$short_id <- as.character(cardia.data$short_id)
+# decode certain variables into factors
+cardia.data$SEX <- factor(cardia.data$SEX, levels = c(1,2), labels = c("Male", "Female"))
+cardia.data$RACE <- factor(cardia.data$RACE, levels = c(4,5), labels = c("Black", "White"))
+cardia.data$diab8 <- factor(cardia.data$diab8, levels = c(0,1), labels = c("No", "Yes"))
+cardia.data$bpmed8 <- factor(cardia.data$bpmed8, levels = c(0,1), labels = c("No", "Yes"))
+cardia.data$cholmed8 <- factor(cardia.data$cholmed8, levels = c(0,1), labels = c("No", "Yes"))
+
+# add in the center coding for the clinical data
+# 1=BHAM, 2=CHIC, 3=MINN, 4=OAKL
+cardia.data$CENTER <- factor(cardia.data$CENTER, levels = 1:4, labels = c("BHAM", "CHIC", "MINN", "OAKL"))
+cardia.data$center25 <- factor(cardia.data$center25, levels = 1:4, labels = c("BHAM", "CHIC", "MINN", "OAKL"))
+
+dataForModels <- cardia.data %>%
+                 inner_join(CARDIA_Y25_Final_Proteomics, by="short_id")
+
+dim(dataForModels)
+dataForModels <- dataForModels %>%
+                 filter(EXCLUDE2==0)
+dim(dataForModels)
+```
+
+So we excluded 275 individuals due to other conditions that cause hepatic steatosis
+
+Create binary variable for NAFLD
+
+**from Greg Terry (VUMC)**
+
+There should also be variable called HR3LAMEAN that is mean of all those ROIs. That is the key variable for continuous attenuation. Of course, <=40 HU is cutpoint used for NAFLD or  <51 is equivalent to liver/spleen ratio <1.0 and is often used too. 
+
+**Andrew's plan**
+
+We will use the cutoff of ≤40, which is in line with the VanWagner paper above
+
+```{r}
+table(is.na(dataForModels$HR3LAMEAN))
+dim(dataForModels)
+dataForModels <- dataForModels %>%
+                 drop_na(HR3LAMEAN) %>% # exclude those without steatosis measurements
+                 mutate(nafld = ifelse(HR3LAMEAN <=40, 1, 0))
+dataForModels$nafld <- as.factor(dataForModels$nafld)
+dim(dataForModels)
+```
+
+So we lost 11 participants for lacking liver fat measures. 
+
+# Define adjustments
+
+```{r}
+adjustmentList <- list(unadjusted = NULL,
+                       
+                       ageSexRace = c("EX8_AGE",
+                                      "SEX",
+                                      "RACE"),
+                       
+                       ageSexRaceBMI = c("EX8_AGE",
+                                          "SEX",
+                                          "RACE",
+                                          "H20BMI"),
+                       
+                       ageSexRaceBMIdrinks = c("EX8_AGE",
+                                               "SEX",
+                                               "RACE",
+                                               "H20BMI",
+                                               "drink_wk"),
+                       full = c("EX8_AGE",
+                                 "SEX",
+                                 "RACE",
+                                 "H20BMI",
+                                 "drink_wk",
+                                "H02CSAVG",
+                                "bpmed8",
+                                "cholmed8",
+                                "diab8",
+                                "ltsmk25",
+                                "HL1CHOL",
+                                "HL1HDL",
+                                "HL7GFR",
+                                "H18TOTAL")
+                         )
+```
+
+# Check distributions
+
+We will select complete cases based on our adjustments
+
+```{r}
+dim(dataForModels)
+dataForModels <- dataForModels %>% drop_na(adjustmentList$ageSexRaceBMIdrinks)
+dim(dataForModels)
+```
+
+```{r}
+# pdf("nafld_distributions.pdf")
+Hmisc::hist.data.frame(dataForModels[,c("HR3LAMEAN", adjustmentList$ageSexRaceBMIdrinks)])
+# dev.off()
+```
+
+Why are there negative values for liver fat?  
+Per Greg Terry via email on 7/21/23 "These folks have fatty, fatty liver. All good and expected!"
+
+Log transform.  
+BMI. 
+
+After we print table 1 though
+
+# Split Derive/Validate and Table 1
+```{r}
+table1vars <- c(adjustmentList$full, c("center25",
+                                       "H02CDAVG",
+                                        "H0YHBA1C",
+                                        "CVHBHI25",
+                                        "HR3LAMEAN",
+                                        "nafld",
+                                        "HR3VISFATVOL",
+                                        "HR3SBCTFATVOL"))
+
+label.key <- list(EX8_AGE ~ "Age",
+                  SEX ~ "Sex",
+                  RACE ~ "Race",
+                  H20BMI ~ "BMI",
+                  center25 ~ "CARIDA field center",
+                  H02CSAVG ~ "Mean SBP",
+                  H02CDAVG ~ "Mean DBP",
+                  bpmed8 ~ "On HTN med.",
+                  cholmed8 ~ "On lipid med.",
+                  diab8 ~ "Diabetes",
+                  ltsmk25 ~ "Lifetime pack-yrs smoking",
+                  HL7GFR ~ "eGFR",
+                  H0YHBA1C ~ "A1c",
+                  HL1CHOL ~ "Total cholesterol",
+                  HL1HDL ~ "HDL",
+                  HR3LAMEAN ~ "Mean liver attenutation",
+                  nafld ~ "NAFLD",
+                  HR3VISFATVOL ~ "VAT",
+                  HR3SBCTFATVOL ~ "SAT",
+                  CVHBHI25 ~ "Sum of AHA LSS",
+                  drink_wk ~ "Drinks/wk",
+                  H18TOTAL ~ "Physical activity score (H18 total)")
+
+# balance the derive/validate by liver fat
+set.seed(1234)
+trainIndex <- caret::createDataPartition(dataForModels$HR3LAMEAN, 
+                                           p=0.70,
+                                           list = FALSE,
+                                           times = 1)
+dataForModels$derive <- NA
+dataForModels[trainIndex[,1], "derive"] <- "derivation"
+dataForModels[-trainIndex[,1], "derive"] <- "validation"
+
+gtsummary::tbl_summary(dataForModels,
+                       include = all_of(table1vars),
+                       label = label.key,
+                       by="derive",
+                       statistic = list(all_continuous() ~  "{median} ({p25}, {p75}); {p_miss}%", all_categorical() ~ "{n} ({p}%); {p_miss}%"),
+                       missing = "no") %>%
+                       add_overall() %>%
+                       add_p()
+
+dataForModels$H20BMI <- log(dataForModels$H20BMI)
+```
+
+
+# Marty Larsen function
+
+```{r}
+marty_larsen <- function(predictor, outcome, family, adjustments = NULL, input_data){
+  
+  ifelse(is.null(adjustments), rhs <- predictor ,rhs <- paste(predictor, paste(adjustments, collapse = "+"), sep = "+"))
+  
+  fmla <- as.formula(paste0(outcome,"~",rhs))
+  temp <- glm(fmla, data=input_data, family = family)
+  
+  output <- data.frame(Outcome = outcome,
+                       AptName = predictor,
+                       UniProt = protein.dictionary$UniProt[protein.dictionary$AptName==predictor],
+                       EntrezGeneSymbol = protein.dictionary$EntrezGeneSymbol[protein.dictionary$AptName==predictor],
+                       Target = protein.dictionary$Target[protein.dictionary$AptName==predictor],
+                       TargetFullName = protein.dictionary$TargetFullName[protein.dictionary$AptName==predictor],
+                       beta = summary(temp)$coefficients[predictor,"Estimate"],
+                       stdError = summary(temp)$coefficients[predictor,"Std. Error"],
+                       p.val = summary(temp)$coefficients[predictor, grep("Pr(>|[[:lower:]]|)", colnames(summary(temp)$coefficients), value = TRUE)],
+                       nobs = nobs(temp))
+  
+  rm(temp); rm(rhs); rm(fmla);
+  return(output)
+}
+```
+
+# Lasso function
+
+```{r}
+fit_control <- trainControl(method="repeatedcv",
+                            number=10,
+                            repeats=5,
+                            returnData=FALSE, 
+                            savePredictions = "all", 
+                            allowParallel = TRUE) 
+
+lasso <- function(outcome, predictors, family, forcedAdjustments=NULL, input_data){
+  if(is.null(forcedAdjustments)){
+    rhs <- paste(predictors, collapse = "+")
+  } else {
+      rhs <- paste(c(forcedAdjustments, predictors), collapse = "+")
+      }
+
+  fmla<-as.formula(paste(outcome, "~", rhs))
+  
+  set.seed(1234)
+  lasso.output <- caret::train(fmla,
+                              data=input_data,
+                              penalty.factor = c(rep(0, length(forcedAdjustments)), rep(1, length(predictors))),
+                              method="glmnet",
+                              family=family,
+                              tuneGrid=expand.grid(alpha=1,
+                                                   lambda= 10**(seq(-5,5,by=0.2))),
+                              trControl=fit_control)
+  
+  return(lasso.output)
+}
+```
+
+We will do marty larsens on all of the proteins in CARDIA
+
+We will do lassos on all of the proteins in CARDIA. In a separate markdown I will recalibrate the score for use in UK Biobank.
+
+```{r}
+# lists to store output
+marty.output <- NULL
+lasso.models <- NULL
+lasso.scores <- NULL
+rfeModels <- NULL
+rfe.scores <- NULL
+
+#setup parallel processing
+cores <- detectCores()-2
+registerDoParallel(cores=cores)
+
+outcome <- "nafld"
+i <- names(adjustmentList)[4]
+
+# loop over adjustments we could force into the model
+for(outcome in c("HR3LAMEAN", "nafld")){
+  for(i in names(adjustmentList)){
+    family <- case_when(outcome=="HR3LAMEAN" ~ "gaussian",
+                        outcome=="nafld" ~ "binomial")
+    
+    derive <- dataForModels %>% 
+              filter(derive == "derivation") %>%
+              select(all_of(c("short_id", outcome, adjustmentList[[i]], proteins.to.use))) %>% 
+              filter(complete.cases(.))
+    
+    validate <- dataForModels %>% 
+              filter(derive == "validation") %>%
+              select(all_of(c("short_id", outcome, adjustmentList[[i]], proteins.to.use))) %>% 
+              filter(complete.cases(.))
+    
+    # scale derivation and validation separately. recall I had scaled the whole cohort above
+    derive[,c(proteins.to.use)] <- scale(derive[,c(proteins.to.use)])
+    validate[,c(proteins.to.use)] <- scale(validate[,c(proteins.to.use)])
+    
+    # only scale the continuous outcome
+    if(outcome == "HR3LAMEAN"){
+      derive[,c(outcome)] <- scale(derive[,c(outcome)])
+      validate[,c(outcome)] <- scale(validate[,c(outcome)])
+    }
+    
+    ##
+    ## Marty Larsen
+    ##
+    # Marty's on the derivation sample
+    marty.output[[outcome]][[i]][["derive"]] <- foreach(k=proteins.to.use, .combine = "rbind") %dopar% {
+    marty_larsen(outcome=outcome, predictor=k, family = family, adjustments = adjustmentList[[i]], input_data=derive)
+    }
+    # Marty's on the validation sample
+    marty.output[[outcome]][[i]][["validate"]] <- foreach(k=proteins.to.use, .combine = "rbind") %dopar% {
+    marty_larsen(outcome=outcome, predictor=k, family = family, adjustments = adjustmentList[[i]], input_data=validate)
+    }
+    
+    # don't need to do LASSO models on the "full" adjustment set
+    if(i=="full"){next}
+  
+    ##
+    ## LASSO
+    ##
+    # Create lasso models using the derivation sample
+    lasso.models[[outcome]][[i]] <- lasso(outcome=outcome,
+                                        predictors=proteins.to.use,
+                                        family = family,
+                                        forcedAdjustments=adjustmentList[[i]],
+                                        input_data = derive %>% select(!short_id))
+    
+    # pull out the coefficients for the proteins
+    temp <- data.frame(as.matrix(coef(lasso.models[[outcome]][[i]]$finalModel, lasso.models[[outcome]][[i]]$bestTune$lambda))) %>% rownames_to_column(var="AptName")
+    coef.vector <- as.vector(temp$s1[grepl("seq", temp$AptName)])
+    
+    
+    # calculate & store the derivation samples lasso scores
+    
+    # make sure things are lined up
+    if(!identical(colnames(derive %>% select(proteins.to.use)), temp$AptName[grepl("seq", temp$AptName)])){
+      print("ERROR: LASSO score construction is wrong. Matrix colnames do not match coef.vector")
+    }
+    
+    lasso.scores[[outcome]][[i]][["derive"]] <- data.frame(short_id = derive$short_id,
+                                           s1 = as.matrix(derive %>% select(all_of(proteins.to.use))) %*% coef.vector
+    )
+    
+    
+    # calculate & store the validation samples lasso scores
+    
+    # make sure things are lined up
+    if(!identical(colnames(validate %>% select(proteins.to.use)), temp$AptName[grepl("seq", temp$AptName)])){
+      print("ERROR: LASSO score construction is wrong. Matrix colnames do not match coef.vector")
+    }
+    
+    lasso.scores[[outcome]][[i]][["validate"]] <- data.frame(short_id = validate$short_id,
+                                             s1 = as.matrix(validate %>% select(all_of(proteins.to.use))) %*% coef.vector
+    )
+    
+    ##
+    ## RFE (removed on 8/14/23 due to skepticism in RFE results in other analyses)
+    ##
+    ## I am using this to create several RFE models (like creating several LASSO models above) to determine how to best 
+    ## select a panel of 21 proteins. At present, I do not think it is possible to "force" variables into an RFE. 
+    ## It would be really attractive (I think) to do RFE to select 21 proteins that are conditioned on a set of adjustments
+    ## (e.g., age, sex, race, BMI) but I don't think that is possible. Alternatively, I will use RFE to select 21+ features
+    ## and examine whether the adjustments are selected in the models.
+    ##
+    ## Recall that RFE simply creates an LM model after selecting the most important variables. So I could identify 21 proteins
+    ## then put those into an lm model alongside the adjustments of choice to create my model/score.
+    
+    # create our model formula
+    # if(is.null(adjustmentList[[i]])){
+    #   rhs <- paste(proteins.to.use, collapse = "+")
+    # } else {
+    #     rhs <- paste(c(adjustmentList[[i]], proteins.to.use), collapse = "+")
+    # }
+    # fmla <- paste(outcome, "~", rhs)
+    # # fmla <- as.formula(fmla)
+    #   
+    # if(outcome=="HR3LAMEAN"){
+    #   ctrl <- rfeControl(functions = lmFuncs, # this needs to change based on outcome liver fat v nafld
+    #                      method = "cv",
+    #                      number=5,
+    #                      verbose = FALSE,
+    #                      allowParallel = TRUE)
+    # } else {
+    #   ctrl <- rfeControl(functions = lrFuncs, # this needs to change based on outcome liver fat v nafld
+    #                      method = "cv",
+    #                      number=5,
+    #                      verbose = FALSE,
+    #                      allowParallel = TRUE)
+    # }
+    # 
+    # set.seed(1234)
+    # rfeModels[[outcome]][[i]][["full"]] <- caret::rfe(as.formula(fmla),
+    #                                               #     x = derive %>% select(all_of(c(adjustmentList[[i]], proteins.to.use))),
+    #                                               # y = derive %>% pull(outcome),
+    #                                            data = derive,
+    #                                            sizes = 1:length(proteins.to.use), # RFE over all proteins
+    #                                            rfeControl = ctrl)
+    # 
+    # # best size on minimizing RMSE
+    # max.size <- pickSizeBest(rfeModels[[outcome]][[i]][["full"]]$results, metric="Accuracy", maximize = FALSE)
+    # # Tolerance 5% of minimal RMSE
+    # min.size <- pickSizeTolerance(rfeModels[[outcome]][[i]][["full"]]$results, metric="Accuracy", tol=5, maximize = FALSE)
+    # 
+    # #
+    # # Now do 5% tolerated RFE
+    # # 
+    # set.seed(1234)
+    # rfeModels[[outcome]][[i]][["tol5"]] <- rfe(as.formula(fmla),
+    #                                            # x = derive %>% select(all_of(c(adjustmentList[[i]], proteins.to.use))),
+    #                                            #    y = derive %>% pull(outcome),
+    #                                            data = derive,
+    #                                            sizes = 1:length(proteins.to.use),
+    #                                            size = min.size,
+    #                                            rfeControl = ctrl)
+    # 
+    # #
+    # # Now do RFE for 21 proteins
+    # # 
+    # set.seed(1234)
+    # rfeModels[[outcome]][[i]][["olink21"]] <- rfe(as.formula(fmla),
+    #                                               # x = derive %>% select(all_of(c(adjustmentList[[i]], proteins.to.use))),
+    #                                               # y = derive %>% pull(outcome),
+    #                                            data = derive,
+    #                                            sizes = 1:length(proteins.to.use),
+    #                                            size = 21 + length(adjustmentList[[i]]),
+    #                                            rfeControl = ctrl)
+    # 
+    # #
+    # # calculate RFE scores in derive and validate
+    # #
+    # if(outcome == "HR3LAMEAN"){
+    #   rfe.scores[[outcome]][[i]][["derive"]] = data.frame(short_id = derive$short_id,
+    #                                                       rfe.full.score = predict(rfeModels[[outcome]][[i]][["full"]], newdata=derive),
+    #                                                       rfe.tol5.score = predict(rfeModels[[outcome]][[i]][["tol5"]], newdata=derive),
+    #                                                       rfe.olink21.score = predict(rfeModels[[outcome]][[i]][["olink21"]], newdata=derive))
+    #   
+    #   rfe.scores[[outcome]][[i]][["validate"]] = data.frame(short_id = validate$short_id,
+    #                                                         rfe.full.score = predict(rfeModels[[outcome]][[i]][["full"]], newdata=validate),
+    #                                                         rfe.tol5.score = predict(rfeModels[[outcome]][[i]][["tol5"]], newdata=validate),
+    #                                                         rfe.olink21.score = predict(rfeModels[[outcome]][[i]][["olink21"]], newdata=validate))
+    # } else {
+    #   rfe.scores[[outcome]][[i]][["derive"]] = data.frame(short_id = derive$short_id,
+    #                                                       rfe.full.score = predict(rfeModels[[outcome]][[i]][["full"]], newdata=derive) %>% pull("1"),
+    #                                                       rfe.tol5.score = predict(rfeModels[[outcome]][[i]][["tol5"]], newdata=derive) %>% pull("1"),
+    #                                                       rfe.olink21.score = predict(rfeModels[[outcome]][[i]][["olink21"]], newdata=derive) %>% pull("1"))
+    #   
+    #   rfe.scores[[outcome]][[i]][["validate"]] = data.frame(short_id = validate$short_id,
+    #                                                         rfe.full.score = predict(rfeModels[[outcome]][[i]][["full"]], newdata=validate) %>% pull("1"),
+    #                                                         rfe.tol5.score = predict(rfeModels[[outcome]][[i]][["tol5"]], newdata=validate) %>% pull("1"),
+    #                                                         rfe.olink21.score = predict(rfeModels[[outcome]][[i]][["olink21"]], newdata=validate) %>% pull("1"))
+    # }
+    
+    rm(derive, validate, coef.vector, temp);
+  }
+}
+
+stopImplicitCluster()
+```
+
+# Lambda check
+
+Check that the lambda is not at the edge of the search grid
+
+```{r}
+lasso.coefs <- NULL
+
+for(i in names(lasso.models)){
+  for(j in names(lasso.models[[i]])){
+    print(paste(i,j))
+    print(range(lasso.models[[i]][[j]][["pred"]][["lambda"]]))
+    print(range(lasso.models[[i]][[j]][["bestTune"]][["lambda"]]))
+    
+    temp <- data.frame(as.matrix(coef(lasso.models[[i]][[j]]$finalModel, lasso.models[[i]][[j]]$bestTune$lambda))) %>% rownames_to_column(var="AptName")
+    colnames(temp)[colnames(temp)=="s1"] <-paste0(i,j)
+    lasso.coefs[[paste0(i,"_",j)]] <- temp
+    
+    rm(temp)
+  }
+}
+
+lasso.coefs <- plyr::join_all(lasso.coefs, type="full", by="AptName")
+lasso.coefs <- lasso.coefs %>% 
+               left_join(protein.dictionary %>% select(AptName, UniProt, EntrezGeneSymbol, Target, TargetFullName), by="AptName") %>% 
+               relocate(UniProt, EntrezGeneSymbol, Target, TargetFullName, .after = AptName) %>%
+               arrange(AptName)
+
+scores <- colnames(lasso.coefs %>% select(contains("HR3LAMEAN") | contains("nafld")))
+knitr::kable(apply(lasso.coefs %>% filter(grepl("seq.", AptName)) %>% select(all_of(scores)), 2, function(x) sum(x!=0, na.rm=TRUE)), caption = "Number of proteins in LASSO models")
+```
+
+The above supports the lambda search grid is appropriate. The optimal lambda is not near the edges.
+
+# create a 21 protein score
+
+```{r}
+# identify the top 21 protein coefs from the age, sex, race, bmi adjusted lasso model
+lasso.coefs <- lasso.coefs %>% 
+                filter(!is.na(UniProt)) %>% 
+                mutate(coef.rank = rank(-abs(HR3LAMEANageSexRaceBMI))) %>% 
+                mutate(HR3LAMEANageSexRaceBMItop21 = case_when(coef.rank<=21 ~ HR3LAMEANageSexRaceBMI,
+                                                               .default = 0))
+
+derive <- dataForModels %>% 
+          filter(derive == "derivation") %>%
+          select(all_of(c("short_id", outcome, adjustmentList$ageSexRaceBMI, proteins.to.use))) %>% 
+          filter(complete.cases(.))
+
+validate <- dataForModels %>% 
+          filter(derive == "validation") %>%
+          select(all_of(c("short_id", outcome, adjustmentList$ageSexRaceBMI, proteins.to.use))) %>% 
+          filter(complete.cases(.))
+
+# scale derivation and validation separately. recall I had scaled the whole cohort above
+derive[,c(proteins.to.use)] <- scale(derive[,c(proteins.to.use)])
+validate[,c(proteins.to.use)] <- scale(validate[,c(proteins.to.use)])
+
+# top21 score in derivation
+# make sure things are lined up
+if(!identical(colnames(derive %>% select(lasso.coefs$AptName[grepl("seq", lasso.coefs$AptName)])), lasso.coefs$AptName[grepl("seq", lasso.coefs$AptName)])){
+  print("ERROR: LASSO score construction is wrong. Matrix colnames do not match coef.vector")
+}
+coef.vector <- lasso.coefs$HR3LAMEANageSexRaceBMItop21[grepl("seq", lasso.coefs$AptName)]
+
+lasso.scores[["HR3LAMEAN"]][["ageSexRaceBMItop21"]][["derive"]] <- data.frame(short_id = derive$short_id,
+                                         s1 = as.matrix(derive %>% select(lasso.coefs$AptName[grepl("seq", lasso.coefs$AptName)])) %*% coef.vector
+)
+
+# top 21 score in validation                                         
+# make sure things are lined up
+if(!identical(colnames(validate %>% select(lasso.coefs$AptName[grepl("seq", lasso.coefs$AptName)])), lasso.coefs$AptName[grepl("seq", lasso.coefs$AptName)])){
+  print("ERROR: LASSO score construction is wrong. Matrix colnames do not match coef.vector")
+}
+coef.vector <- lasso.coefs$HR3LAMEANageSexRaceBMItop21[grepl("seq", lasso.coefs$AptName)]
+
+lasso.scores[["HR3LAMEAN"]][["ageSexRaceBMItop21"]][["validate"]] <- data.frame(short_id = validate$short_id,
+                                         s1 = as.matrix(validate %>% select(lasso.coefs$AptName[grepl("seq", lasso.coefs$AptName)])) %*% coef.vector
+)
+```
+
+
+# Compare Marty's and LASSO coefs
+
+```{r}
+temp <- marty.output$HR3LAMEAN$ageSexRaceBMI$derive %>%
+        left_join(lasso.coefs %>% select(where(is.character), HR3LAMEANageSexRaceBMI))
+
+ggplot(temp, aes(HR3LAMEANageSexRaceBMI, beta)) +
+  geom_point() +
+  theme_bw() +
+  labs(x="LASSO coef",
+       y="Marty coef",
+       subtitle = "derivation")
+
+temp <- marty.output$HR3LAMEAN$ageSexRaceBMI$validate %>%
+        left_join(lasso.coefs %>% select(where(is.character), HR3LAMEANageSexRaceBMI))
+
+ggplot(temp, aes(HR3LAMEANageSexRaceBMI, beta)) +
+  geom_point() +
+  theme_bw() +
+  labs(x="LASSO coef",
+       y="Marty coef",
+       subtitle = "validation")
+
+rm(temp)
+```
+
+# Model fit
+
+Plot scatters of scores against liver fat in derivation and validation, report R/rho
+
+```{r}
+for(i in names(lasso.scores)){
+  for(j in names(lasso.scores[[i]])){
+    for(k in names(lasso.scores[[i]][[j]])){
+      # merge in the data
+      temp <- lasso.scores[[i]][[j]][[k]] %>% left_join(dataForModels %>% select(all_of(c("short_id", i))), by="short_id")
+      # scale score
+      temp$s1 <- scale(temp$s1)
+      
+      if(i == "HR3LAMEAN"){
+        print(
+          ggplot(temp, aes(x=s1, y=HR3LAMEAN)) +
+            geom_point(size=0.3) +
+            theme_classic() +
+            labs(x = paste(j, "score of", i, "in CARDIA", k),
+                 y = i,
+                 title = paste("N:", nrow(temp))) +
+            ggpubr::stat_cor(method = "spearman",
+                             cor.coef.name = "rho") +
+            stat_smooth(formula = y ~ x,
+                        method = "lm",
+                        se = FALSE,
+                        linetype = "dashed")
+        )
+      }
+        
+      if(i == "nafld"){
+        print(
+          ggplot(temp, aes(x=s1, y = ..count.., color = nafld, fill = nafld)) +
+            geom_histogram(alpha=0.25, position = "identity") +
+            theme_classic() +
+            labs(x = paste(j, "score of", i, "in CARDIA", k),
+               y = "Count",
+               title = paste("N:", nrow(temp)))
+        )
+      }
+        
+      
+      # rm(temp)
+    }
+  }
+}
+```
+
+Plot relations of scores against age, sex, race, BMI
+
+```{r}
+for(i in names(lasso.scores)){
+  for(j in names(lasso.scores[[i]])){
+    temp <- bind_rows(lasso.scores[[i]][[j]], .id = "derive")
+    temp <- temp %>% left_join(dataForModels %>% select(all_of(c("short_id", adjustmentList$ageSexRaceBMI))), by="short_id")
+    
+    # scale score
+    temp$s1 <- scale(temp$s1)
+    
+    # AGE
+    print(
+      ggplot(temp, aes(y=s1, x=EX8_AGE, color = derive)) +
+        geom_point(position = "jitter", size=0.05) +
+        theme_classic() +
+        labs(y = paste(j, "score of", i, "in CARDIA, derive+validate"),
+             x = "Age",
+             title = paste("N:", nrow(temp))) +
+        ggpubr::stat_cor(method = "spearman",
+                         cor.coef.name = "rho") +
+        stat_smooth(formula = y ~ x,
+                    method = "lm",
+                    se = FALSE,
+                    linetype = "dashed")
+    )
+    
+    # SEX
+    print(
+      ggplot(temp, aes(x=s1, y = ..count.., color = SEX, fill = SEX)) +
+        geom_histogram(alpha=0.25, position = "identity") +
+        theme_classic() +
+        labs(x = paste(j, "score of", i, "in CARDIA, derive+validate"),
+           y = "Count",
+           title = paste("N:", nrow(temp)))
+    )
+    # RACE
+    print(
+      ggplot(temp, aes(x=s1, y = ..count.., color = RACE, fill = RACE)) +
+        geom_histogram(alpha=0.25, position = "identity") +
+        theme_classic() +
+        labs(x = paste(j, "score of", i, "in CARDIA, derive+validate"),
+           y = "Count",
+           title = paste("N:", nrow(temp)))
+    )
+    
+    # BMI
+    print(
+      ggplot(temp, aes(y=s1, x=H20BMI, color = derive)) +
+        geom_point(position = "jitter", size=0.05) +
+        theme_classic() +
+        labs(y = paste(j, "score of", i, "in CARDIA, derive+validate"),
+             x = expression(log(BMI)),
+             title = paste("N:", nrow(temp))) +
+        ggpubr::stat_cor(method = "spearman",
+                         cor.coef.name = "rho") +
+        stat_smooth(formula = y ~ x,
+                    method = "lm",
+                    se = FALSE,
+                    linetype = "dashed")
+    )
+  }
+}
+```
+
+# Validation odds of liver fat on top of the overall model
+
+What are some published prediction models for NAFLD?
+
+https://www.ncbi.nlm.nih.gov/pmc/articles/PMC9381583/
+
+https://www.sciencedirect.com/science/article/pii/S0168827817324364?via%3Dihub
+
+https://www.nature.com/articles/s41591-019-0665-2
+
+My take away from this prior literature is that a score using age, sex, race, bmi, AST, ALT, A1c would be a very reasonable clinical model to compare our proteomics against.
+
+**Prediction of NAFLD in holdout set using the LASSO**
+Specify logistic model - 
+**Base clinical model:** age/sex/race/BMI  
+**Model 1:** age/sex/race/BMI/drinks + AST + ALT + scale(log(HbA1c))  
+**Model 2:** age/sex/race/BMI/drinks + AST + ALT + scale(log(HbA1c)) + full protein score    
+**Model 3:** age/sex/race/BMI/drnink + AST + ALT + scale(log(HbA1c)) + top21 protein score   
+
+
+Get the ORs and 95% CI
+Get the confusion Matrix for the full model and 21 model; compare to the model 1 and model 2 (make a nice table, sens, spec, accuracy, etc.)
+
+```{r}
+validate <- dataForModels %>% 
+              filter(derive == "validation") %>%
+              select(all_of(c("short_id", outcome, adjustmentList$ageSexRaceBMIdrinks, "seq.4912.17", "seq.3709.4", "H0YHBA1C"))) %>% 
+              left_join(lasso.scores$HR3LAMEAN$ageSexRaceBMI$validate, by="short_id") %>%
+              rename(HR3LAMEANageSexRaceBMI = s1) %>%
+              left_join(lasso.scores$HR3LAMEAN$ageSexRaceBMItop21$validate, by="short_id") %>%
+              rename(HR3LAMEANageSexRaceBMItop21 = s1) %>%
+              filter(complete.cases(.))
+
+hist(validate$H0YHBA1C)
+hist(scale(log(validate$H0YHBA1C)))
+
+base.model = glm(nafld ~ EX8_AGE + SEX + RACE + scale(H20BMI), family = "binomial", data = validate, x=TRUE)
+model.1 = glm(nafld ~ EX8_AGE + SEX + RACE + scale(H20BMI) + drink_wk + scale(seq.4912.17) + scale(seq.3709.4) + scale(log(H0YHBA1C)), family = "binomial", data = validate, x=TRUE)
+model.2 = glm(nafld ~ EX8_AGE + SEX + RACE + scale(H20BMI) + drink_wk + scale(seq.4912.17) + scale(seq.3709.4) + scale(log(H0YHBA1C)) + scale(HR3LAMEANageSexRaceBMI), family = "binomial", data = validate, x=TRUE)
+model.3 = glm(nafld ~ EX8_AGE + SEX + RACE + scale(H20BMI) + drink_wk + scale(seq.4912.17) + scale(seq.3709.4) + scale(log(H0YHBA1C)) + scale(HR3LAMEANageSexRaceBMItop21), family = "binomial", data = validate, x=TRUE)
+
+# capture the model coefs, std error, z, p values
+model.summaries <- as.data.frame(summary(base.model)$coefficients) %>% rownames_to_column(var="covariate") %>% mutate(model = "base.model")
+model.summaries <- model.summaries %>% bind_rows(as.data.frame(summary(model.1)$coefficients) %>% rownames_to_column(var="covariate") %>% mutate(model = "model.1"))
+model.summaries <- model.summaries %>% bind_rows(as.data.frame(summary(model.2)$coefficients) %>% rownames_to_column(var="covariate") %>% mutate(model = "model.2"))
+model.summaries <- model.summaries %>% bind_rows(as.data.frame(summary(model.3)$coefficients) %>% rownames_to_column(var="covariate") %>% mutate(model = "model.3"))
+
+# Prediction using the logistic models
+# this gives a probability of having NAFLD
+validation.data <- validate
+validation.data$base.model.class.prob <- predict(base.model, newdata = validation.data, type = "response")
+validation.data$model.1.class.prob <- predict(model.1, newdata = validation.data, type = "response")
+validation.data$model.2.class.prob <- predict(model.2, newdata = validation.data, type = "response")
+validation.data$model.3.class.prob <- predict(model.3, newdata = validation.data, type = "response")
+
+# create factor variables for y/n prediction of NAFLD based on probability from above
+prob.cutoff <- 0.50
+validation.data$base.model.class <- case_when(validation.data$base.model.class.prob>=prob.cutoff ~ 1,
+                                              validation.data$base.model.class.prob<prob.cutoff ~ 0)
+validation.data$model.1.class <- case_when(validation.data$model.1.class.prob>=prob.cutoff ~ 1,
+                                              validation.data$model.1.class.prob<prob.cutoff ~ 0)
+validation.data$model.2.class <- case_when(validation.data$model.2.class.prob>=prob.cutoff ~ 1,
+                                              validation.data$model.2.class.prob<prob.cutoff ~ 0)
+validation.data$model.3.class <- case_when(validation.data$model.3.class.prob>=prob.cutoff ~ 1,
+                                              validation.data$model.3.class.prob<prob.cutoff ~ 0)
+
+validation.data$base.model.class <- as.factor(validation.data$base.model.class)
+validation.data$model.1.class <- as.factor(validation.data$model.1.class)
+validation.data$model.2.class <- as.factor(validation.data$model.2.class)
+validation.data$model.3.class <- as.factor(validation.data$model.3.class)
+
+output.matrix <- matrix(nrow = 4, ncol=18)
+rownames(output.matrix) <- c("base.model", "model.1", "model.2", "model.3")
+# confusion matrices
+for(i in c("base.model", "model.1", "model.2", "model.3")){
+  print(i)
+  test <- caret::confusionMatrix(data = validation.data[[paste0(i,".class")]], reference = validation.data$nafld, positive="1")
+  print(test)
+  output.matrix[i,] <- unname(c(test$overall, test$byClass))
+}
+colnames(output.matrix) <- c(names(test$overall), names(test$byClass))
+
+htmlTable::htmlTable(t(round(output.matrix, 2)))
+
+output.matrix <- as.data.frame(output.matrix)
+output.matrix <- output.matrix %>% rownames_to_column(var="model")
+
+rmarkdown::paged_table(output.matrix)
+```
+
+Check the model calibration (Hosmer Lemeshow test)
+Base model
+```{r}
+performance::performance_hosmer(base.model)
+```
+
+Model 1
+```{r}
+performance::performance_hosmer(model.1)
+```
+
+Model 2
+```{r}
+performance::performance_hosmer(model.2)
+```
+
+Model 3
+```{r}
+performance::performance_hosmer(model.3)
+```
+
+Get the NRI for model 3 vs. model 2 and model 1 (you can do two NRIs)
+
+```{r}
+NRI.Cstat.Output <- tibble(old.model = character(),
+                           new.model = character(),
+                           old.cindex = character(),
+                           new.cindex = character(),
+                           cindex.compare.pval = double(),
+                           NRI.overall = character(),
+                           NRI.events = character(),
+                           NRI.nonevents = character())
+
+
+nri.model.2.model.1 <- nribin(mdl.std = model.1,
+                               mdl.new = model.2,
+                               cut=0.50,
+                              niter=5)
+
+nri.summary <- paste0(signif(nri.model.2.model.1$nri$Estimate, 2), " (",signif(nri.model.2.model.1$nri$Lower, 2) , "-", signif(nri.model.2.model.1$nri$Upper, 2) , ")")
+
+NRI.Cstat.Output <- NRI.Cstat.Output %>% add_row(old.model = "model.1",
+                                                 new.model = "model.2",
+                                                 NRI.overall = nri.summary[1],
+                                                 NRI.events = nri.summary[2],
+                                                 NRI.nonevents = nri.summary[3])
+
+nri.model.3.model.1 <- nribin(mdl.std = model.1,
+                               mdl.new = model.3,
+                               cut=0.50,
+                              niter=5)
+
+nri.summary <- paste0(signif(nri.model.3.model.1$nri$Estimate, 2), " (",signif(nri.model.3.model.1$nri$Lower, 2) , "-", signif(nri.model.3.model.1$nri$Upper, 2) , ")")
+
+NRI.Cstat.Output <- NRI.Cstat.Output %>% add_row(old.model = "model.1",
+                                                 new.model = "model.3",
+                                                 NRI.overall = nri.summary[1],
+                                                 NRI.events = nri.summary[2],
+                                                 NRI.nonevents = nri.summary[3])
+```
+
+Create ROC curve in publication format (model 1, model 2, model 3) or at least model 1 and Model 3;
+
+```{r}
+# ROC construction of base to full model
+
+model.1_roc = plot(roc(validation.data$nafld ~ validation.data$model.1.class.prob, plot = TRUE, print.auc = TRUE))
+model.2_roc = plot(roc(validation.data$nafld ~ validation.data$model.2.class.prob, plot = TRUE, print.auc = TRUE))
+model.3_roc = plot(roc(validation.data$nafld ~ validation.data$model.3.class.prob, plot = TRUE, print.auc = TRUE))
+
+# Plot the ROC curves on the same plot
+plot(model.1_roc, col = "red"); lines(model.2_roc, col = "blue"); lines(model.3_roc, col="green"); legend("bottomright", legend = c("Model 1 (clinical)", "Model 2 (full protein score)", "Model 3 (top 21 protein score"),
+       col = c("red", "blue", "green"), lty = 1)
+
+NRI.Cstat.Output$old.cindex[NRI.Cstat.Output$new.model=="model.2"] <- paste0(round(model.1_roc$auc, 2), " (", round(as.numeric(ci(model.1_roc))[1], 2), "-", round(as.numeric(ci(model.1_roc))[3], 2), ")")
+NRI.Cstat.Output$old.cindex[NRI.Cstat.Output$new.model=="model.3"] <- paste0(round(model.1_roc$auc, 2), " (", round(as.numeric(ci(model.1_roc))[1], 2), "-", round(as.numeric(ci(model.1_roc))[3], 2), ")")
+NRI.Cstat.Output$new.cindex[NRI.Cstat.Output$new.model=="model.2"] <- paste0(round(model.2_roc$auc, 2), " (", round(as.numeric(ci(model.2_roc))[1], 2), "-", round(as.numeric(ci(model.2_roc))[3], 2), ")")
+NRI.Cstat.Output$new.cindex[NRI.Cstat.Output$new.model=="model.3"] <- paste0(round(model.3_roc$auc, 2), " (", round(as.numeric(ci(model.3_roc))[1], 2), "-", round(as.numeric(ci(model.3_roc))[3], 2), ")")
+NRI.Cstat.Output$cindex.compare.pval[NRI.Cstat.Output$new.model=="model.2"] <- roc.test(model.1_roc, model.2_roc)$p.value
+NRI.Cstat.Output$cindex.compare.pval[NRI.Cstat.Output$new.model=="model.3"] <- roc.test(model.1_roc, model.3_roc)$p.value
+
+roc.test(model.1_roc, model.2_roc)
+roc.test(model.1_roc, model.3_roc)
+roc.test(model.2_roc, model.3_roc)
+
+rmarkdown::paged_table(NRI.Cstat.Output)
+```
+
+# Save output
+
+## output Marty results
+
+```{r}
+HR3LAMEAN_marty <- NULL
+nafld_marty <- NULL
+
+for(i in names(marty.output$HR3LAMEAN)) {
+  derive <- marty.output[["HR3LAMEAN"]][[i]][["derive"]] %>%
+            rename(der_beta = beta,
+                   der_stdError = stdError,
+                   der_p = p.val,
+                   der_n = nobs)
+  validate <- marty.output[["HR3LAMEAN"]][[i]][["validate"]] %>%
+              rename(val_beta = beta,
+                     val_stdError = stdError,
+                     val_p = p.val,
+                     val_n = nobs)
+  
+  HR3LAMEAN_marty[[i]] <- derive %>% 
+                          left_join(validate) %>% 
+                          mutate(der_fdr = p.adjust(der_p, method="BH")) %>% 
+                          group_by(der_fdr<0.05) %>% 
+                          mutate(val_fdr = p.adjust(val_p)) %>% 
+                          mutate(val_fdr = case_when(der_fdr>=0.05 ~ NA,
+                                                    .default = val_fdr)) %>%
+                          relocate(der_fdr, .after=der_p) %>%
+                          relocate(val_fdr, .after=val_p) %>%
+                          ungroup() %>%
+                          select(!where(is.logical))
+}
+
+openxlsx::write.xlsx(HR3LAMEAN_marty, file = "HR3LAMEAN_Cardia_lm_protein.xlsx")
+
+for(i in names(marty.output$nafld)) {
+  derive <- marty.output[["nafld"]][[i]][["derive"]] %>%
+            rename(der_beta = beta,
+                   der_stdError = stdError,
+                   der_p = p.val,
+                   der_n = nobs)
+  validate <- marty.output[["nafld"]][[i]][["validate"]] %>%
+              rename(val_beta = beta,
+                     val_stdError = stdError,
+                     val_p = p.val,
+                     val_n = nobs)
+  
+  nafld_marty[[i]] <- derive %>% 
+                      left_join(validate) %>% 
+                      mutate(der_fdr = p.adjust(der_p, method="BH")) %>% 
+                      group_by(der_fdr<0.05) %>% 
+                      mutate(val_fdr = p.adjust(val_p)) %>% 
+                      mutate(val_fdr = case_when(der_fdr>=0.05 ~ NA,
+                                                .default = val_fdr)) %>%
+                      relocate(der_fdr, .after=der_p) %>%
+                      relocate(val_fdr, .after=val_p) %>%
+                      ungroup() %>%
+                      select(!where(is.logical))
+}
+
+openxlsx::write.xlsx(nafld_marty, file = "nalfd_Cardia_lm_protein.xlsx")
+
+outputFilesToMd5 <- c(outputFilesToMd5, "HR3LAMEAN_Cardia_lm_protein.xlsx", "nalfd_Cardia_lm_protein.xlsx")
+```
+
+## Output MD5 and Session Info
+```{r}
+outputFilesToMd5 <- c(outputFilesToMd5, "CARDIA_NAFLD.Rdata")
+save.image("CARDIA_NAFLD.Rdata")
+
+dataFileInfo=data.frame(
+  File=basename(outputFilesToMd5),
+  md5=tools::md5sum(outputFilesToMd5)
+)
+
+knitr::kable(dataFileInfo)
+
+
+sessionInfo()
+```

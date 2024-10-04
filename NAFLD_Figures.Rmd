@@ -1,0 +1,609 @@
+---
+title: "NAFLD Figures"
+author: "Andrew Perry"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Import data
+
+```{r}
+library(tidyverse)
+library(readr)
+library(ComplexHeatmap)
+
+cardia.rdata.file <- "/Users/perry/Library/CloudStorage/OneDrive-VUMC/Research/CARDIA/NAFLD/Coding Files/CARDIA_NAFLD.Rdata"
+
+filesToMd5 <- c(cardia.rdata.file)
+
+dataFileInfo=data.frame(
+  File=basename(filesToMd5),
+  md5=tools::md5sum(filesToMd5)
+)
+
+knitr::kable(dataFileInfo)
+load(cardia.rdata.file)
+```
+
+# check if the HIV proteins made into the lasso coefs
+
+```{r}
+table(lasso.coefs %>% 
+        left_join(protein.dictionary) %>%
+        filter(HR3LAMEANageSexRaceBMI != 0) %>%
+        pull(Organism)
+)
+```
+
+Our LASSO model for HR3LAMEAN (continuous fatty liver measure) with forced adjustments for age/sex/race/bmi only contains HUMAN proteins.
+
+# SteatoSITE output
+
+```{r}
+steato.site <- HR3LAMEAN_marty$ageSexRaceBMI
+
+
+top50absBeta <- steato.site %>%
+                  filter(val_fdr<0.05) %>%
+                  mutate(coef.rank = rank(-abs(der_beta))) %>%
+                  filter(coef.rank<=50) %>% pull(AptName)
+
+top25posNegBeta <- steato.site %>% 
+                  filter(val_fdr<0.05) %>%
+                  mutate(coef.rank = rank(der_beta)) %>%
+                  filter(coef.rank<=25 | coef.rank >=(length(coef.rank)-24)) %>% pull(AptName)
+
+steato.site <- steato.site %>% mutate(allFDRsig = case_when(val_fdr<0.05 ~ 1,
+                                                            val_fdr>=0.05 ~ 0),
+                                      top50absBeta = case_when(AptName %in% top50absBeta ~ 1,
+                                                               !AptName %in% top50absBeta ~ 0),
+                                      top25posNegBeta = case_when(AptName %in% top25posNegBeta ~ 1,
+                                                               !AptName %in% top25posNegBeta ~ 0)
+)
+
+readr::write_csv(steato.site,
+                 "dataForSteatoSITE.csv")
+
+tools::md5sum("dataForSteatoSITE.csv")
+```
+
+# Distribution of covariates, gghistogram by NAFLD status of the HR3LAMEAN
+
+```{r}
+temp <- dataForModels %>% select(!any_of(proteins.to.use))
+sort(colnames(temp))
+```
+
+## Age
+```{r}
+ggplot(temp, aes(EX8_AGE, HR3LAMEAN)) +
+  geom_point(aes(col=densCols(EX8_AGE, HR3LAMEAN, colramp = colorRampPalette(rev(rainbow(10, end = 4/6))))), position = "jitter") +
+  scale_color_identity() +
+  theme_bw() +
+  ggpubr::stat_cor(cor.coef.name="rho", method="spearman") +
+  labs(x="Age",
+       y="Liver attenuation")
+ggsave("HR3LAMEAN_vs_age_CARDIA.pdf", height = 4, width = 6, device = "pdf")
+```
+
+
+```{r}
+ggplot(temp %>% mutate(NAFLD = factor(nafld, levels=0:1, labels=c("No", "Yes"))), aes(x=EX8_AGE)) +
+  geom_histogram(aes(fill=NAFLD, col=NAFLD), position = "identity", alpha=0.25, binwidth = 1) +
+  theme_bw() +
+  labs(x="Age",
+       y="Count",
+       subtitle = "CARDIA Year 25") 
+ggsave("NAFLD_vs_age_CARDIA.pdf", height = 4, width = 6, device = "pdf")
+```
+
+## BMI
+
+```{r}
+ggplot(temp, aes(exp(H20BMI), HR3LAMEAN)) +
+  geom_point(aes(col=densCols(exp(H20BMI), HR3LAMEAN, colramp = colorRampPalette(rev(rainbow(10, end = 4/6)))))) +
+  scale_color_identity() +
+  theme_bw() +
+  ggpubr::stat_cor(cor.coef.name="rho", method="spearman", label.x.npc = "right", hjust=1) +
+  labs(x="BMI",
+       y="Liver attenuation")
+ggsave("HR3LAMEAN_vs_BMI_CARDIA.pdf", height = 4, width = 6, device = "pdf")
+
+```
+
+```{r}
+ggplot(temp %>% mutate(NAFLD = factor(nafld, levels=0:1, labels=c("No", "Yes"))), aes(x=exp(H20BMI))) +
+  geom_histogram(aes(fill=NAFLD, col=NAFLD), position = "identity", alpha=0.25) +
+  theme_bw() +
+  labs(x="BMI",
+       y="Count",
+       subtitle = "CARDIA Year 25")
+ggsave("NAFLD_vs_age_CARDIA.pdf", height = 4, width = 6, device = "pdf")
+
+```
+
+## Sex and race distribution of HR3LAMEAN
+
+```{r}
+colorset <- c("Female" = "darkorange", "Male" = "forestgreen")
+
+summary(lm(HR3LAMEAN ~ SEX*RACE, data=temp))
+
+ggplot(temp, aes(x=HR3LAMEAN)) +
+  geom_density(aes(colour = SEX, linetype = RACE)) +
+  geom_vline(xintercept = 40, color="purple", linetype="dashed") +
+  scale_fill_manual(values=colorset) +
+  scale_colour_manual(values = colorset) +
+  labs(x = "Liver attenuation\n(<40 ~ MASLD)",
+       y = "Density",
+       subtitle = "All CARDIA participants") +
+  theme_bw() +
+  guides(color=guide_legend(title = "Gender"),
+         linetype=guide_legend(title = "Race"))
+ggsave("HR3LAMEAN_vs_SexRace_CARDIA.pdf", height = 4, width = 6, device = "pdf")
+
+```
+
+
+
+# Plot volcano for the main model in pub format - use those that pass derivation and test in the validation set
+
+```{r}
+ggplot(HR3LAMEAN_marty$ageSexRaceBMI %>% filter(!is.na(val_fdr)), aes(x=val_beta, y=-log(val_p, base=10), label = EntrezGeneSymbol)) +
+  geom_point(aes(col=val_fdr<0.05)) +
+  ggsci::scale_color_npg(name = "FDR", labels = c(">=5%", "<5%")) +
+  theme_bw() +
+  ggrepel::geom_text_repel(size=2) +
+  # guides(color=guide_legend(title="FDR<5%")) +
+  # scale_color_discrete(name = "FDR", labels = c("≥5%", "<5%")) +
+  labs(subtitle = "CARDIA Validation, N: 803",
+       x=expression(CARDIA~Validation~beta),
+       y=expression(-log[10](p)),
+       caption = "Adjusted for age, gender, race, and BMI.\nFiltered to show proteins with FDR<5% in derivation.") +
+  theme(legend.position = "right")
+ggsave("nafld_validation_volcano.pdf")
+```
+
+Caption: Volcano plot of proteins related to liver attenuation (negative beta coefficients ~ more fatty liver). Proteins visualized passed FDR<5% in the derivation sample. Model results from the validation sample are used for visualization.
+
+
+# Plot marty on marty for derive/validate
+
+```{r}
+temp <- HR3LAMEAN_marty$ageSexRaceBMI %>% mutate(col = densCols(HR3LAMEAN_marty$ageSexRaceBMI$der_beta, HR3LAMEAN_marty$ageSexRaceBMI$val_beta, colramp = colorRampPalette(rev(rainbow(10, end = 4/6)))))
+
+cor(temp$der_beta, temp$val_beta, method = "spearman")
+cor.test(temp$der_beta, temp$val_beta, method = "spearman")$p.value
+
+ggplot(temp, aes(x=der_beta, y=val_beta)) +
+  geom_point(aes(col=col)) +
+  scale_color_identity() +
+  ggpubr::stat_cor(method = "spearman", cor.coef.name = "rho") +
+  theme_bw() +
+  labs(x=expression(CARDIA~Derivation~beta),
+       y=expression(CARDIA~Validation~beta))
+
+ggsave("CARDIA_der_val_beta_on_beta.pdf")
+rm(temp)
+```
+
+# Plot marty on marty for validation: main model vs. full model beta; identify how many continue to retain significance after full adjustment
+
+```{r}
+temp <- HR3LAMEAN_marty$ageSexRaceBMI %>% 
+        select(where(is.character), contains("val")) %>% 
+        rename_with(~gsub("val", "ageSexRaceBMI_val", .x), contains("val"))
+
+temp2 <- HR3LAMEAN_marty$full %>% 
+         select(where(is.character), contains("val")) %>%
+         rename_with(~gsub("val", "full_val", .x), contains("val"))
+
+temp <- temp %>% left_join(temp2) %>% mutate(col = densCols(temp$ageSexRaceBMI_val_beta, temp$full_val_beta, colramp = colorRampPalette(rev(rainbow(10, end = 4/6)))))
+
+cor(temp$ageSexRaceBMI_val_beta, temp$full_val_beta, method = "spearman")
+cor.test(temp$ageSexRaceBMI_val_beta, temp$full_val_beta, method = "spearman")$p.value
+
+ggplot(temp, aes(ageSexRaceBMI_val_beta, full_val_beta)) +
+  geom_point(aes(col=col)) +
+  scale_color_identity() +
+  theme_bw() +
+  labs(x=expression(CARDIA~Validation~Age/Gender/Race/BMI~beta),
+       y=expression(CARDIA~Validation~Full~beta)) +
+  ggpubr::stat_cor(cor.coef.name = "rho", method="spearman")
+ggsave("ageSexRaceBMI_full_beta_on_beta.pdf")
+
+table(temp$ageSexRaceBMI_val_fdr<0.05, temp$full_val_fdr<0.05, exclude = NULL)
+```
+
+So we have 88+157+14=259 proteins that pass FDR<5% in the main (age/sex/race/bmi) model
+
+And we have 160 that pass FDR<5% in the full model
+
+# Heatmap of LASSO proteins and cluster
+Annotation bar of +/- NAFLD, HRLAMEAN and BMI.  
+I am using the age, sex, race, and BMI adjusted LASSO models.  
+
+Since we have ~300 proteins in the lasso models for HR3LAMEAN, for visualization purposes I will include the top 50 (ranked by abs(beta)) in the heatmap
+
+I am also going to filter the participants to show it in the validation sample.
+
+```{r}
+set.seed(12)
+lasso.proteins <- lasso.coefs %>% 
+                  filter(grepl("seq.", AptName)) %>% 
+                  filter(coef.rank<=50) %>% pull(AptName)
+
+marty.proteins <- HR3LAMEAN_marty$ageSexRaceBMI %>%
+                  filter(val_fdr<0.05) %>%
+                  mutate(coef.rank = rank(der_beta)) %>%
+                  filter(coef.rank<=25 | coef.rank >(length(der_beta)-24)) %>% pull(AptName)
+
+plotData <- dataForModels %>%
+            filter(derive=="validation") %>%
+            select(all_of(c("short_id", "H20BMI", "HR3LAMEAN", "nafld", marty.proteins))) %>%
+            arrange(desc(HR3LAMEAN))
+
+plotData$nafld <- factor(plotData$nafld,
+                         levels = 0:1,
+                         labels = c("No", "Yes"))
+
+ha <- HeatmapAnnotation(`BMI` = exp(plotData$H20BMI),
+                        `MASLD` = plotData$nafld,
+                        `CT Liver attenutation` = plotData$HR3LAMEAN,
+                        which = "column",
+                        simple_anno_size = unit(0.3, "cm"),
+                        annotation_name_gp = grid::gpar(fontsize = 6))
+
+
+mat <- plotData %>% select(all_of(marty.proteins))
+name.change <- data.frame(AptName = colnames(mat))
+name.change <- name.change %>% left_join(protein.dictionary %>% select(AptName, EntrezGeneSymbol), by="AptName")
+
+colnames(mat)[match(name.change$AptName, colnames(mat))] <- name.change$EntrezGeneSymbol
+colnames(mat) <- name.change$EntrezGeneSymbol
+
+pdf("NAFLD_heatmap_MartyProteins.pdf", height = 7, width = 11)
+draw(
+  Heatmap(as.matrix(t(mat)),
+          name = "Normalized, log-transformed protein abundance",
+          top_annotation = ha,
+          cluster_columns = FALSE,
+          clustering_method_rows = "ward.D2",
+          # clustering_distance_rows = "ward.D2",
+          # clustering_method_columns = "ward.D2",
+          # clustering_distance_columns = "ward.D2",
+          cluster_rows = TRUE,
+          show_row_dend = FALSE,
+          show_column_dend = FALSE,
+          row_names_gp = grid::gpar(fontsize = 6),
+          heatmap_legend_param = list(direction = "horizontal",
+                                      title_position = "topcenter")),
+  annotation_legend_side = "right",
+  heatmap_legend_side = "bottom"
+)
+dev.off()
+```
+
+Caption: Proteins were selected by filtering to the proteins with FDR <5% in CARDIA derivation and validation then ranking on the derivation sample beta coef (top 50 abs(beta)). Columns are participants, ordered by liver attenutation. Rows are clustered (cluster method = "complete" distance = "euclidean"). Heatmap fill is the relative protein abundance (log transformed) in the validation sample.
+
+# Show LASSO calibration across derivation and validation
+
+top 21
+```{r}
+temp <- bind_rows(lasso.scores$HR3LAMEAN$ageSexRaceBMItop21, .id = "derive") %>% 
+        left_join(dataForModels %>% select(short_id, HR3LAMEAN, nafld), by="short_id")
+
+temp$nafld <- factor(temp$nafld,
+                     levels = 0:1,
+                     labels = c("No", "Yes"))
+temp$derive <- factor(temp$derive,
+                      levels = c("derive", "validate"),
+                      labels = c("CARDIA Derivation, N: 1876", "CARDIA Validation, N: 803"))
+
+ggplot(temp, aes(x=s1, y=HR3LAMEAN)) +
+  geom_point(aes(color = densCols(s1, HR3LAMEAN, colramp = colorRampPalette(rev(rainbow(10, end = 4/6)))))) +
+  scale_color_identity() +
+  facet_wrap(.~derive) +
+  geom_hline(yintercept = 40, color="black", linetype = "dashed") +
+  theme_bw() +
+  theme(aspect.ratio = 1) +
+  labs(x = "Top 21 protein score of liver attenuation",
+       y = "CT liver attenuation (HU)",
+       caption = "Dashed line is the clincally used cutoff (<40) for MASLD") +
+  ggpubr::stat_cor(method = "spearman",
+                   cor.coef.name = "rho")
+ggsave("lasso_calibration_top21_CARDIA.pdf", height = 4, width = 6, device = "pdf")
+```
+
+full
+```{r}
+temp <- bind_rows(lasso.scores$HR3LAMEAN$ageSexRaceBMI, .id = "derive") %>% 
+        left_join(dataForModels %>% select(short_id, HR3LAMEAN, nafld), by="short_id")
+
+temp$nafld <- factor(temp$nafld,
+                     levels = 0:1,
+                     labels = c("No", "Yes"))
+temp$derive <- factor(temp$derive,
+                      levels = c("derive", "validate"),
+                      labels = c("CARDIA Derivation, N: 1876", "CARDIA Validation, N: 803"))
+
+ggplot(temp, aes(x=s1, y=HR3LAMEAN)) +
+  geom_point(aes(color = densCols(s1, HR3LAMEAN, colramp = colorRampPalette(rev(rainbow(10, end = 4/6)))))) +
+  scale_color_identity() +
+  facet_wrap(.~derive) +
+  geom_hline(yintercept = 40, color="black", linetype = "dashed") +
+  theme_bw() +
+  theme(aspect.ratio = 1) +
+  labs(x = "Protein score of liver attenuation",
+       y = "CT liver attenuation (HU)",
+       caption = "Dashed line is the clincally used cutoff (<40) for MASLD") +
+  ggpubr::stat_cor(method = "spearman",
+                   cor.coef.name = "rho")
+ggsave("lasso_calibration_CARDIA.pdf", height = 4, width = 6, device = "pdf")
+
+# ggplot(temp, aes(x=s1, y = ..count.., color = nafld, fill = nafld)) +
+#   geom_histogram(alpha=0.25, position = "identity") +
+#   facet_wrap(.~derive) +
+#   ggsci::scale_fill_npg() +
+#   ggsci::scale_color_npg() +
+#   theme_bw() +
+#   theme(legend.position = "bottom") +
+#   labs(x = "Lasso score of liver attenuation",
+#      y = "Density",
+#      title = paste("CARDIA Derivation, N:", nrow(temp))) +
+#   guides(color = guide_legend(title = "NAFLD"),
+#          fill = guide_legend(title = "NAFLD"))
+
+t.test(temp$s1[temp$derive=="CARDIA Derivation, N: 1876" & temp$nafld=="No"],
+       temp$s1[temp$derive=="CARDIA Derivation, N: 1876" & temp$nafld=="Yes"])
+
+t.test(temp$s1[temp$derive=="CARDIA Validation, N: 803" & temp$nafld=="No"],
+       temp$s1[temp$derive=="CARDIA Validation, N: 803" & temp$nafld=="Yes"])
+
+summary(lm(s1 ~ derive*nafld, data=temp))
+
+ggplot(temp, aes(x=s1, y = ..density.., color = nafld, fill = nafld)) +
+  geom_density(alpha=0.25, position = "identity") +
+  facet_wrap(.~derive) +
+  ggsci::scale_fill_npg() +
+  ggsci::scale_color_npg() +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        aspect.ratio = 1) +
+  labs(x = "Protein score of liver attenuation",
+     y = "Density") +
+  guides(color = guide_legend(title = "MASLD"),
+         fill = guide_legend(title = "MASLD")) +
+  annotate("text", x = -2, y = 1,
+           label=expression(italic(p)<2.2e-16))
+ggsave("lasso_by_NAFLD_CARDIA.pdf", height = 4, width = 6, device = "pdf")
+
+
+```
+
+# Show LASSO score by age, sex, race, BMI
+
+```{r}
+temp <- bind_rows(lasso.scores$HR3LAMEAN$ageSexRaceBMI, .id = "derive")
+temp <- temp %>% left_join(dataForModels %>% select(all_of(c("short_id", adjustmentList$ageSexRaceBMIdrinks))), by="short_id")
+
+# scale score
+temp$s1 <- scale(temp$s1)
+```
+
+
+## AGE
+```{r}
+ggplot(temp, aes(y=s1, x=EX8_AGE)) +
+  geom_point(aes(color = densCols(temp$EX8_AGE, temp$s1, colramp = colorRampPalette(rev(rainbow(10, end = 4/6))))), position = "jitter") +
+  scale_color_identity() +
+  theme_bw() +
+  labs(y = "Protein score of liver attenuation",
+       x = "Age",
+       subtitle = paste("CARDIA Derivation & Validation, N:", nrow(temp))) +
+  ggpubr::stat_cor(method = "spearman",
+                   cor.coef.name = "rho") +
+  theme(legend.position = "bottom")
+ggsave("ageSexRaceBMI_lasso_HR3LAMEAN_age_DeriveValidate.pdf", height = 4, width = 6, device = "pdf")
+```
+
+## SEX & RACE
+```{r}
+colorset <- c("Female" = "darkorange", "Male" = "forestgreen")
+
+summary(lm(s1 ~ SEX*RACE, data=temp))
+
+ggplot(temp, aes(x=s1)) +
+  geom_density(aes(colour = SEX, linetype = RACE)) +
+  scale_fill_manual(values=colorset) +
+  scale_colour_manual(values = colorset) +
+  labs(x = "Protein score of liver attenuation",
+       y = "Density",
+       subtitle = paste("CARDIA Derivation & Validation, N:", nrow(temp))) +
+  theme_bw() +
+  guides(color=guide_legend(title = "Gender"),
+         linetype=guide_legend(title = "Race")) +
+  annotate("text", x = -4, y = 0.5, hjust = 0, vjust=1,
+           label=expression(Gender~italic(p)==0.095)) +
+  annotate("text", x = -4, y = 0.45, hjust=0, vjust=1,
+           label=expression(Race~italic(p)==3.92e-7))
+ggsave("ageSexRaceBMI_lasso_HR3LAMEAN_vs_SexRace_CARDIA.pdf", height = 4, width = 6, device = "pdf")
+```
+
+
+## BMI
+```{r}
+ggplot(temp, aes(y=s1, x=exp(H20BMI))) +
+  geom_point(aes(color = densCols(exp(temp$H20BMI), temp$s1, colramp = colorRampPalette(rev(rainbow(10, end = 4/6)))))) +
+  scale_color_identity() +
+  theme_bw() +
+  labs(y = "Protein score of liver attenuation",
+       x = "BMI",
+       subtitle = paste("CARDIA Derivation & Validation, N:", nrow(temp))) +
+  ggpubr::stat_cor(method = "spearman",
+                   cor.coef.name = "rho",
+                   label.x.npc = "right",
+                   hjust = 1)  +
+  guides(color = guide_legend(title = "CARDIA Sample")) +
+  theme(legend.position = "bottom")
+ggsave("ageSexRaceBMI_lasso_HR3LAMEAN_BMI_DeriveValidate.pdf", height = 4, width = 6, device = "pdf")
+```
+
+## Alcohol use
+
+```{r}
+ggplot(temp %>% drop_na(drink_wk), aes(y=s1, x=drink_wk)) +
+  geom_point(aes(color = densCols(temp$drink_wk, temp$s1, colramp = colorRampPalette(rev(rainbow(10, end = 4/6))))), position = "jitter") +
+  scale_color_identity() +
+  theme_bw() +
+  labs(y = "Protein score of liver attenuation",
+       x = "Alcoholic drinks per week",
+       subtitle = paste("CARDIA Derivation & Validation, N:", nrow(temp %>% drop_na(drink_wk)))) +
+  ggpubr::stat_cor(method = "spearman",
+                   cor.coef.name = "rho",
+                   label.x.npc = "right",
+                   hjust = 1)  +
+  guides(color = guide_legend(title = "CARDIA Sample")) +
+  theme(legend.position = "bottom")
+ggsave("ageSexRaceBMI_lasso_HR3LAMEAN_etohdrinks_DeriveValidate.pdf", height = 4, width = 6, device = "pdf")
+```
+
+
+# Show how the score is related to liver attenutation across categories of BMI
+
+```{r}
+temp <- temp %>% 
+        filter(derive=="validate") %>%
+        mutate(Category = case_when(exp(H20BMI) <30 ~ "Normal/Overweight",
+                                    exp(H20BMI) >=30 ~ "Obese")) %>%
+        left_join(cardia.data %>% select(short_id, HR3LAMEAN, HR3VISFATVOL))
+
+table(temp$Category, exclude = NULL)
+
+ggplot(temp, aes(s1, HR3LAMEAN, color=Category)) +
+  geom_point(size=0.7) +
+  theme_bw() +
+  ggsci::scale_color_npg() +
+  ggpubr::stat_cor(method = "spearman", cor.coef.name = "rho", show.legend = FALSE) +
+  geom_hline(yintercept = 40, color="black", linetype="dashed") +
+  labs(y="CT liver attenuation (HU)",
+       x="Protein score of liver attenuation",
+       subtitle = paste0("CARDIA Validation, N: ", nrow(temp),
+                         "\n  Normal/Overweight, N: ", nrow(temp %>% filter(Category=="Normal/Overweight")),
+                         "\n  Obese, N: ", nrow(temp %>% filter(Category=="Obese"))),
+       caption = "Dashed line is the clincally used cutoff (<40) for MASLD") +
+  guides(color=guide_legend(title = "")) +
+  theme(legend.position = "bottom")
+ggsave("lasso_calibration_by_ov-ob.pdf", height = 4, width = 6, device = "pdf")
+
+
+ggplot(temp, aes(HR3VISFATVOL, s1)) +
+  geom_point()
+```
+
+```{r}
+summary(lm(HR3LAMEAN ~ s1, data=temp))
+
+summary(lm(HR3LAMEAN ~ s1+H20BMI, data=temp))
+
+summary(lm(HR3LAMEAN ~ s1*H20BMI, data=temp))
+```
+
+# ROC Curves
+
+I am trying to make something prettier than this
+
+```{r, eval=FALSE}
+plot(model.1_roc, col = "red");
+  lines(model.2_roc, col = "blue");
+  lines(model.3_roc, col="green");
+  legend("bottomright", legend = c("Model 1 (clinical)", "Model 2 (full protein score)", "Model 3 (top 21 protein score"),
+       col = c("red", "blue", "green"), lty = 1)
+```
+
+```{r, eval=TRUE}
+mod1 <- data.frame(Model = "Model 1 (clinical)",
+                   Sensitivity = model.1_roc$sensitivities,
+                   Specificity = model.1_roc$specificities)
+
+mod2 <- data.frame(Model = "Model 2 (full protein score)",
+                   Sensitivity = model.2_roc$sensitivities,
+                   Specificity = model.2_roc$specificities)
+
+mod3 <- data.frame(Model = "Model 3 (top 21 protein score)",
+                   Sensitivity = model.3_roc$sensitivities,
+                   Specificity = model.3_roc$specificities)
+
+temp <- bind_rows(mod1, mod2, mod3)
+
+ggplot(temp, aes(Specificity, Sensitivity)) +
+  geom_line(aes(col=Model)) +
+  ggsci::scale_color_npg() +
+  xlim(1, 0) +
+  theme_bw() +
+  theme(aspect.ratio = 1,
+        legend.position = "bottom") +
+  guides(color = guide_legend(title = "")) +
+  annotate("text", x = 0.75, y = 0.5,
+           label = "AUC:\nModel 1 (clinical): 0.84 (0.80-0.88)\nModel 2 (full protein score): 0.94 (0.92-0.96)\nModel 3 (top 21 protein score): 0.94 (0.93-0.96)", hjust=0, vjust=1, size=2.5) +
+  labs(subtitle = "CARDIA Validation, N: 793")
+ggsave("ROC_CARDIA_Validate.pdf", device = "pdf")
+```
+
+Base clinical model: age/sex/race/BMI
+Model 1: age/sex/race/BMI/drinks + AST + ALT + scale(log(HbA1c))
+Model 2: age/sex/race/BMI/drinks + full protein score
+Model 3: age/sex/race/BMI/drnink + top21 protein score
+
+```{r, eval=FALSE}
+library(pROC)
+roc.list <- roc(nafld ~ model.1.class.prob + model.2.class.prob + model.3.class.prob, data = validation.data)
+
+
+ci.list <- lapply(roc.list, ci.se, specificities = seq(0, 1, l = 25))
+
+dat.ci.list <- lapply(ci.list, function(ciobj) 
+  data.frame(x = as.numeric(rownames(ciobj)),
+             lower = ciobj[, 1],
+             upper = ciobj[, 3]))
+
+names(roc.list) <- c("Model 1 (clinical)", "Model 2 (full protein score)", "Model 3 (top 21 protein score)")
+
+p <- ggroc(roc.list) + 
+  theme_bw() + 
+  ggsci::scale_fill_npg() +
+  geom_abline(slope=1, intercept = 1, linetype = "dashed", alpha=0.7, color = "grey") + 
+  coord_equal()
+
+for(i in 1:3) {
+  p <- p + geom_ribbon(
+    data = dat.ci.list[[i]],
+    aes(x = x, ymin = lower, ymax = upper),
+    fill = i + 1,
+    alpha = 0.2,
+    inherit.aes = F) 
+  } 
+
+p +
+  annotate("text", x = 0.75, y = 0.25,
+           label = "AUC:\nModel 1 (clinical): 0.84\nModel 2 (full protein score): 0.94\nModel 3 (top 21 protein score): 0.94", hjust=0, vjust=1, size=3) +
+  theme(legend.position = "bottom") +
+  guides(color = guide_legend(title = "")) +
+  labs(subtitle = "CARDIA Validation, N: 793",
+       y="Sensitivity",
+       x="Specificity")
+ggsave("ROC_CARDIA_Validate.pdf", device = "pdf")
+```
+
+# Save output
+
+```{r}
+save.image("NAFLD_Figures.Rdata")
+tools::md5sum("NAFLD_Figures.Rdata")
+
+sessionInfo()
+```
