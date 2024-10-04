@@ -1,0 +1,242 @@
+---
+title: "NAFLD_UKB_Figure_revision"
+author: "Andrew Perry"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# libraries
+
+```{r}
+library(tidyverse)
+```
+
+# import
+```{r}
+ukbb.cox <- readr::read_csv("/Users/perry/Library/CloudStorage/OneDrive-VUMC/Research/CARDIA/NAFLD/UKBB/Revision1/updated_nafld_ukbb_cox_results.csv")
+nri.cstat <- readr::read_csv("/Users/perry/Library/CloudStorage/OneDrive-VUMC/Research/CARDIA/NAFLD/UKBB/Revision1/updated_ukbb_NRI_Cstat_results.csv")
+fine.gray <- readr::read_csv("/Users/perry/Library/CloudStorage/OneDrive-VUMC/Research/CARDIA/NAFLD/UKBB/Revision1/fineGrayResults.csv")
+
+filesToMd5 <- c("/Users/perry/Library/CloudStorage/OneDrive-VUMC/Research/CARDIA/NAFLD/UKBB/Revision1/updated_nafld_ukbb_cox_results.csv",
+                "/Users/perry/Library/CloudStorage/OneDrive-VUMC/Research/CARDIA/NAFLD/UKBB/Revision1/updated_ukbb_NRI_Cstat_results.csv",
+                "/Users/perry/Library/CloudStorage/OneDrive-VUMC/Research/CARDIA/NAFLD/UKBB/Revision1/fineGrayResults.csv")
+
+dataFileInfo=data.frame(
+  File=basename(filesToMd5),
+  md5=tools::md5sum(filesToMd5)
+)
+
+knitr::kable(dataFileInfo)
+```
+
+# Forest plot
+```{r}
+ukbb.cox$description <- case_when(ukbb.cox$outcome == "CANCER_DEATH01" ~ "Death; cancer",
+                                  ukbb.cox$outcome == "CVD_DEATH01" ~ "Death; cardiovascular",
+                                  ukbb.cox$outcome == "RESP_DEATH01" ~ "Death; respiratory",
+                                  ukbb.cox$outcome == "DEATH01" ~ "Death; all-cause",
+                                  .default = ukbb.cox$description)
+```
+
+```{r}
+dataForPlot <- ukbb.cox %>% 
+                filter(predictor=="HR3LAMEAN_ageSexRaceBMI_restricted") %>% 
+                filter(adjustments %in% c("full","ageSexRaceBMI", "unadjusted"))
+
+dataForPlot$adjustments <- factor(dataForPlot$adjustments,
+                                  levels = c("full", "ageSexRaceBMI", "unadjusted"),
+                                  labels = c("Full", "Age/Gender/Race/BMI", "Unadjusted"))
+
+description.order <- c("Death; all-cause",
+                       "Death; cardiovascular",
+                       "Death; cancer",
+                       
+                       "Ischemic Heart Disease",
+                       "Cerebrovascular disease",
+                       
+                       "Type 2 diabetes",
+                       "Other chronic nonalcoholic liver disease")
+
+
+death.outcomes <- c("Death; all-cause",
+                       "Death; cardiovascular",
+                       "Death; cancer")
+metabolic.outcomes <- c("Type 2 diabetes",
+                       "Overweight and obesity",
+                       "Sleep apnea",
+                       "Disorders of lipid metabolism",
+                       "Other chronic nonalcoholic liver disease",
+                       "Hypertension")
+cvd.outomes <- c("Ischemic Heart Disease",
+                 "Atrial fibrillation and flutter",
+                 "Congestive heart failure; nonhypertensive",
+                 "Other forms of chronic heart disease",
+                 "Peripheral vascular disease",
+                 "Cerebrovascular disease")
+
+dataForPlot <- dataForPlot %>% filter(description %in% description.order)
+dataForPlot$description <- factor(dataForPlot$description,
+                                  levels = description.order)
+
+dataForPlot <- dataForPlot %>% mutate(outcome.cat = case_when(description %in% death.outcomes ~ "Mortality",
+                                                              description %in% metabolic.outcomes ~ "Metabolic",
+                                                              description %in% cvd.outomes ~ "Cardiovascular"))
+dataForPlot$outcome.cat <- factor(dataForPlot$outcome.cat,
+                                  levels = c("Mortality", "Cardiovascular", "Metabolic"))
+
+forest.plot <- ggplot(data = dataForPlot, aes(x=hr, xmin=lower95, xmax=upper95, y=description, col=adjustments, fill=adjustments))+
+  geom_point(position = position_dodge(width=0.5)) +
+  ggsci::scale_color_npg() +
+  ggsci::scale_fill_npg() +
+  geom_errorbarh(height=.1, position = position_dodge(width=0.5)) +
+  geom_vline(aes(xintercept=1), linetype="dashed") +
+  facet_grid(rows=vars(dataForPlot$outcome.cat), scales = "free_y", space = "free_y") +
+  labs(title = "Forest plot of UKBB Cox results",
+       subtitle = "NAFLD",
+       x = "Hazard ratio",
+       y="",
+       caption = "Full adjustment: age, gender, race, BMI, SBP, diabetes, Townsend deprivation index, smoking, alcohol frequency, LDL.") +
+  scale_y_discrete(limits=rev) +
+  theme_bw() +
+  theme(legend.title=element_blank(),
+        # strip.background =element_rect(fill="purple"),
+        # panel.background = element_blank(),
+        plot.caption = element_text(face = "italic", hjust=1, size=6),
+        axis.text.y = element_text(size=12),
+        axis.text.x = element_text(size=6),
+        legend.position = "bottom")
+forest.plot
+
+ggsave(plot=forest.plot, file= "ukbb_forest_main.pdf", device = "pdf", height = 6)
+```
+
+#NRI and c-stat table
+```{r}
+nri.cstat$description <- case_when(nri.cstat$outcome == "CANCER_DEATH01" ~ "Death; cancer",
+                                  nri.cstat$outcome == "CVD_DEATH01" ~ "Death; cardiovascular",
+                                  nri.cstat$outcome == "RESP_DEATH01" ~ "Death; respiratory",
+                                  nri.cstat$outcome == "DEATH01" ~ "Death; all-cause",
+                                  .default = nri.cstat$description)
+
+
+nri.cstat <- nri.cstat %>% filter(description %in% description.order)
+nri.cstat$description <- factor(nri.cstat$description,
+                                  levels = description.order)
+
+nri.cstat <- nri.cstat %>% arrange(description)
+
+df <- data.frame(row.names = nri.cstat$description,
+                 `Base model c-index` = paste0(round(nri.cstat$base.cindex,2),
+                                               " (",
+                                               round(nri.cstat$base.cindex-1.96*nri.cstat$base.cindex.std,2),
+                                               "-",
+                                               round(nri.cstat$base.cindex+1.96*nri.cstat$base.cindex.std,2),
+                                               ")"),
+                 `Base+score model c-index` = paste0(round(nri.cstat$score.cindex,2),
+                                               " (",
+                                               round(nri.cstat$score.cindex-1.96*nri.cstat$score.cindex.std,2),
+                                               "-",
+                                               round(nri.cstat$score.cindex+1.96*nri.cstat$score.cindex.std,2),
+                                               ")"),
+                 `P value` = signif(nri.cstat$cindex.compare.pval,3),
+                 `NRI Overall` = nri.cstat$NRI.overall,
+                 `NRI Events` = nri.cstat$NRI.events,
+                 `NRI Nonevents` = nri.cstat$NRI.nonevents)
+
+write.csv(df, file="nafld-c-index-NRI-table.csv")
+```
+
+# compare top 21 with full protein score
+
+```{r}
+dataForPlot <- ukbb.cox %>% 
+               filter(adjustments == "full" & description %in% description.order) %>% 
+               select(outcome, predictor, hr, lower95, upper95, description) %>% 
+               pivot_wider(names_from = predictor, values_from = all_of(c("hr", "lower95", "upper95")))
+
+
+
+# these were all reported as exp(beta), in other words the hazard ratio, so reverse that here with log
+# also take the inverse so the scale flips
+dataForPlot[,-c(1:2)] <- -log(dataForPlot[,-c(1:2)])
+
+dataForPlot <- dataForPlot %>% mutate(outcome.cat = case_when(description %in% death.outcomes ~ "Mortality",
+                                                              description %in% metabolic.outcomes ~ "Metabolic",
+                                                              description %in% cvd.outomes ~ "CVD"))
+
+ggplot(dataForPlot, aes(x=hr_HR3LAMEAN_ageSexRaceBMI_restricted, y = hr_HR3LAMEAN_ageSexRaceBMI_restricted_top21)) +
+  ggforce::geom_ellipse(aes(x0 = hr_HR3LAMEAN_ageSexRaceBMI_restricted,
+                   y0 = hr_HR3LAMEAN_ageSexRaceBMI_restricted_top21,
+                   a = (upper95_HR3LAMEAN_ageSexRaceBMI_restricted-lower95_HR3LAMEAN_ageSexRaceBMI_restricted)/2,
+                   b = (upper95_HR3LAMEAN_ageSexRaceBMI_restricted_top21-lower95_HR3LAMEAN_ageSexRaceBMI_restricted_top21)/2,
+                   angle = 0,
+                   color=outcome.cat, fill=outcome.cat),
+               alpha = 0.3,
+               linetype = "blank") +
+  ggsci::scale_fill_npg() +
+  ggsci::scale_color_npg() +
+  geom_point(aes(color=outcome.cat, fill=outcome.cat)) +
+  ggpubr::stat_cor(cor.coef.name = "rho", method = "spearman") +
+  # geom_errorbarh(aes(xmin=lower95_HR3LAMEAN_ageSexRaceBMI_restricted, xmax=upper95_HR3LAMEAN_ageSexRaceBMI_restricted)) +
+  # geom_errorbar(aes(ymin=lower95_HR3LAMEAN_ageSexRaceBMI_restricted_top21, ymax=upper95_HR3LAMEAN_ageSexRaceBMI_restricted_top21)) +
+  geom_abline(slope=1, color="firebrick", linetype="dashed") +
+  theme_bw() +
+  ggrepel::geom_text_repel(aes(label = description), max.overlaps = 5, color="black", size=3) +
+  labs(x = "Cox beta with 411 proteins",
+       y = "Cox beta with top 21 proteins") +
+  guides(color=guide_legend(title = ""),
+         fill="none")
+ggsave("nafld_compare21_full_ukbb.pdf")
+```
+
+create csv of the cox model results for the SDF
+```{r}
+temp <- ukbb.cox %>% mutate(description = case_when(is.na(description) ~ gsub("01", "", outcome),
+                                                    .default = description),
+                                predictor = case_when(predictor=="HR3LAMEAN_ageSexRaceBMI_restricted" ~ "full_score",
+                                                      predictor=="HR3LAMEAN_ageSexRaceBMI_restricted_top21" ~ "top21_score"),
+                                HR_sum = paste0(round(hr, 2), " (", round(lower95, 2), "-", round(upper95, 2), ")"),
+                                follow_up_days = paste0(round(medianTimeToEvent), " (", round(p25timeToEvent), "-", round(p75timeToEvent), ")"),
+                            adjustments = case_when(adjustments=="ageSexRaceBMI" ~ "age, sex, race, BMI",
+                                                    adjustments=="full" ~ "age, sex, race, BMI, SBP, diabetes, Townsend deprivation index, smoking, alcohol frequency, LDL",
+                                                    adjustments=="sensitivity" ~ "age, sex, race, BMI, SBP, diabetes, Townsend deprivation index, smoking, alcohol frequency, LDL, AST, ALT, HbA1c",
+                                                    .default = adjustments)) %>%
+    filter(adjustments != "ageSexRace" & adjustments != "ageSexRaceBMIdrinks") %>%
+    select(description, predictor, adjustments, HR_sum, p, n, nevent, follow_up_days) %>%
+    rename(outcome = description,
+           hazard_ratio = HR_sum,
+           n_event = nevent)
+
+readr::write_csv(temp, "ukb_cox_SuppTable.csv")
+```
+
+create csv of the Fine Gray model results for the SDF
+```{r}
+temp <- fine.gray %>% mutate(description = gsub("01", "", outcome),
+                                predictor = case_when(predictor=="HR3LAMEAN_ageSexRaceBMI_restricted" ~ "full_score",
+                                                      predictor=="HR3LAMEAN_ageSexRaceBMI_restricted_top21" ~ "top21_score"),
+                                HR_sum = paste0(round(hr, 2), " (", round(lower95, 2), "-", round(upper95, 2), ")"),
+                                follow_up_days = paste0(round(medianTimeToEvent), " (", round(p25timeToEvent), "-", round(p75timeToEvent), ")"),
+                            adjustments = case_when(adjustments=="ageSexRaceBMI" ~ "age, sex, race, BMI",
+                                                    adjustments=="full" ~ "age, sex, race, BMI, SBP, diabetes, Townsend deprivation index, smoking, alcohol frequency, LDL",
+                                                    adjustments=="sensitivity" ~ "age, sex, race, BMI, SBP, diabetes, Townsend deprivation index, smoking, alcohol frequency, LDL, AST, ALT, HbA1c",
+                                                    .default = adjustments)) %>%
+    filter(adjustments != "ageSexRace" & adjustments != "ageSexRaceBMIdrinks") %>%
+    select(description, predictor, adjustments, HR_sum, p, n, nevent, follow_up_days) %>%
+    rename(outcome = description,
+           hazard_ratio = HR_sum,
+           n_event = nevent) %>%
+    filter(outcome != "RESP_DEATH")
+
+readr::write_csv(temp, "ukb_fineGray_SuppTable.csv")
+```
+
+# save
+
+```{r}
+sessionInfo()
+```
